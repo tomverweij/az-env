@@ -7,43 +7,123 @@ set -e
 # - parameter, for example: klantnaam=test
 # - container base name, default dwh-etl
 
-export MOUNT_ROOT=mnt
-export SHARE_ROOT=/data/source
+# local directory on which to mount the fileshares
+export MOUNT_ROOT='mnt'		# so when invoked from dwh/etl, mounts will appear under etl/dwh/mnt
+export SHARE_ROOT=''
 
-. ${0%/*}/urlencode.sh
+. ${HOME}/bin/urlencode.sh
 
 # use parameters, or use defaults otherwise
+echo ''
+echo 'Step 1: Invocation. Invoked with:'
+echo '---------------------------------'
+echo '$1(env)=                  '$1 
+echo '$2(param)=                '$2 
+echo '$3(containerbasename)=    '$3
+
 environment=${1:-dev}
 param1="$2"
 param1_value="${param1#*=}"
 param1_first3="${param1_value:0:3}"
 container_base_name=${3:-dwh-etl}
 
+# defaults
+echo ''
+echo 'Step 2: Setting defaults:'
+echo '---------------------------------'
+echo '$environment:             '$environment
+echo '$param1:                  '$param1
+echo '$param1_value:            '$param1_value
+echo '$param1_first3:           '$param1_first3
+echo '$container_base_name:     '$container_base_name
+
+# environment variables
+echo ''
+echo 'Step 3: Checking environment variables and dockerfile:'
+echo '---------------------------------'
 if [ -z "${USER}" ]
 then
 	echo "USER env var is not set, please fix"
 	exit 1
+else
+	echo '${USER} set to                  '$USER
 fi
 
 if [ -z "${AZURE_TENANT_ID}" -o -z "${AZURE_SUBSCRIPTION_ID}" -o -z "${KEY_VAULT_NAME}" ]
 then
 	echo "some env vars are missing, please run az-env first"
 	exit 1
+else
+	echo '${AZURE_TENANT_ID} set to       '${AZURE_TENANT_ID}
+	echo '${AZURE_SUBSCRIPTION_ID} set to '${AZURE_SUBSCRIPTION_ID}
+	echo '${KEY_VAULT_NAME} set to        '${KEY_VAULT_NAME}
 fi
 
 if [ ! -f ./Dockerfile ]
 then
 	echo "no Dockerfile found, I am probably in the wrong directory?"
 	exit 1
+else
+	echo 'Found dockerfile:               '`pwd`'/Dockerfile'
 fi
 
+# local run?
+echo ''
+echo 'Step 4: Determine if local run requested'
+echo '---------------------------------'
 run_local=0
 if [[ "$environment" == "local" ]]
 then
 	run_local=1
 fi
+echo 'run_local (1=yes):              '$run_local
 
+# rename and set some more variables
+echo ''
+echo 'Step 5: Setting some more variables'
+echo '---------------------------------'
+client_name=${KEY_VAULT_NAME%-*}
+# container_command="/etl/scripts/etl_${USER}.sh"
+# container_command="/etl/scripts/hlb_camt_${param1_value}.sh"
+container_command="/bin/bash"
+container_command_array="[\"${container_command}\"]"
+if [ -z "${param1_value}" ]
+then
+	deployment_group="container-deployment-${USER}"   # the default name when not specifying a name
+	container_name="${container_base_name}"
+	container_group="${client_name}-${environment}-${container_name}"
+	image_name="${container_name}:${USER}"
+else
+	deployment_group="container-deployment-${USER}-${param1_value}"   # the default name when not specifying a name
+	container_name="${container_base_name}-${param1_value}"
+	container_group="${client_name}-${environment}-${container_name}"
+	image_name="${container_name}:${USER}"
+fi
+export CONF_KEYVAULT=${KEY_VAULT_URI}
+export AZURE_CLIENT_ID=${APP_ETL_CLIENTID}
+export AZURE_CLIENT_SECRET=${APP_ETL_PASSWORD}
+
+echo '$container_name:           '$container_name
+echo '$container_base_name:      '$container_base_name
+echo '$container_command:        '$container_command
+echo '$container_command_array:  '$container_command_array
+echo '$container_group:          '$container_group
+echo '$image_name:               '$image_name
+echo '$deployment_group:         '$deployment_group
+echo '$client_name:              '$client_name
+echo '$environment:              '$environment
+echo '$ACR_REGISTRY:             '$ACR_REGISTRY
+echo 'KEY_VAULT_URI:             '$KEY_VAULT_URI
+
+# function definitions
+# 
+# function to prepare connection the necessary CONN_ variables
 function parse_connection_string {
+	# echo ''
+	# echo 'Called function:    parse_connection_string'
+	# echo '-------------------------------------------'
+	# echo 'Input:              '$1
+	# echo ''
 	OLD_IFS=${IFS}
 	IFS=';'
 	eval $(echo "$1" | (read -s DefaultEndpointsProtocol EndpointSuffix AccountName AccountKey; \
@@ -58,11 +138,24 @@ function parse_connection_string {
 		eval "CONN_SUFFIX=${results[1]}"
 		eval "CONN_ACCOUNT_NAME=${results[2]}"
 		eval "CONN_ACCOUNT_KEY=${results[3]}"
+
+		# echo '.... CONN_PROTOCOL set to      '$CONN_PROTOCOL
+		# echo '.... CONN_SUFFIX set to        '$CONN_SUFFIX
+		# echo '.... CONN_ACCOUNT_NAME set to  '$CONN_ACCOUNT_NAME
+		# echo '.... CONN_ACCOUNT_KEY set to   '$CONN_ACCOUNT_KEY
 	fi
 	IFS=${OLD_IFS}
 }
 
+# function to mount 
 function do_mount {
+	# echo ''
+	# echo 'Called function:    do_mount'
+	# echo '-------------------------------------------'
+	# echo 'Input:              '$1
+	# echo 'Input:              '$2
+	# echo 'Input:              '$3
+	# echo ''
 	arch=$(uname -s)
 	case "${arch}" in
 	Darwin)
@@ -78,6 +171,13 @@ function do_mount {
 }
 
 function do_mount_share {
+	# echo ''
+	# echo 'Called function:    do_mount_share'
+	# echo '-------------------------------------------'
+	# echo 'Input:              '$1 
+	# echo 'Input:              '$2
+	# echo 'Input:              '$3
+	# echo ''
 	arch=$(uname -s)
 	case "${arch}" in
 	Darwin)
@@ -92,113 +192,156 @@ function do_mount_share {
 	esac
 }
 
+#  function to set the keyvault name
+function get_keyvault {
+	# echo ''
+	# echo 'Called function:    get_keyvault'
+	# echo '-------------------------------------------'
+	# echo 'Input:              '$1
+	# echo ''
+	vault_name_list=$(az keyvault list | jq -r ".[].name")
+	vault_name=$(echo "${vault_name_list}" | grep -i "${RESOURCE_GROUP}-${param1_first3}")
+	# if the vault can not be found, fall back to the default version
+	if [ -z "${vault_name}" ]; then
+		vault_name=$(echo "${vault_name_list}" | grep -i "${RESOURCE_GROUP}")
+	fi
+	# echo $vault_name
+}
+
 function docker_mount_binds {
+	# echo ''
+	# echo 'Called function:    docker_mount_binds'
+	# echo '-------------------------------------------'
+	# echo 'Input:              '$1
+	# echo ''
+
 	mount_dir="${MOUNT_ROOT}/$1"
 	mkdir -p "${mount_dir}"
+	# echo 'We will mount on:        '$mount_dir
+	# echo 'Looping over Storage accounts:'
+
 	account_ids=($(az storage account list | jq -r '.[].id' | grep "${RESOURCE_GROUP}"))
 	binds=()
 	for id in ${account_ids[@]}
 	do
-		connection=$(az storage account show-connection-string --ids "${id}" | jq -r ".connectionString")
-		parse_connection_string "${connection}"
-		case "${CONN_ACCOUNT_NAME}" in
+		case "${id##*/}" in 
 		# if the account name equals the resource group without dashes plus 'external', we have the external storage account at hand
 		"${RESOURCE_GROUP//-/}external")
-			# get the specific key vault
-			vault_name_list=$(az keyvault list | jq -r ".[].name")
-			vault_name=$(echo "${vault_name_list}" | grep -i "${RESOURCE_GROUP}-${param1_first3}")
-			# if the vault can not be found, fall back to the default version
-			if [ -z "${vault_name}" ]; then
-				vault_name=$(echo "${vault_name_list}" | grep -i "${RESOURCE_GROUP}")
-			fi
-			#sas_token=$(az keyvault secret show --vault-name "${vault_name}" --name "sas-token" -o json | jq -r ".value")
+			# echo '... matched' ${id##*/} 'as external'
+		# 	echo '... preparing "external" mount on /mnt'
+			connection=$(az storage account show-connection-string --ids "${id}" | jq -r ".connectionString")
+			get_keyvault
+			parse_connection_string "${connection}"
 			key=$(rawurlencode "${CONN_ACCOUNT_KEY}")
-                        shares=($(az storage share list --account-name "${CONN_ACCOUNT_NAME}" --account-key "${CONN_ACCOUNT_KEY}" | jq -r ".[].name"))
-                        for share in ${shares[@]}
-                        do
-			        mount_point="${share}"
-			        local_mount=$(do_mount_share "${mount_point}" "smb://${CONN_ACCOUNT_NAME}:${key}@${CONN_ACCOUNT_NAME}.file.${CONN_SUFFIX}/${share}" "${mount_dir}/${mount_point}")
+			shares=($(az storage share list --account-name "${CONN_ACCOUNT_NAME}" --account-key "${CONN_ACCOUNT_KEY}" | jq -r ".[].name"))
+			for share in ${shares[@]}
+				do
+				if [[ "$share" == "$param1_value" ]]
+				then 
+				# only process the external storageaccount from the given client parameter
+					# echo '..... processing fileshare:           '${share}
+					mount_point="${share}"
+					# echo '....... call do_mount_share $1        '$mount_point
+					# echo '....... call do_mount_share $2        '"smb://${CONN_ACCOUNT_NAME}:${key}@${CONN_ACCOUNT_NAME}.file.${CONN_SUFFIX}/${share}"
+					# echo '....... call do_mount_share $3        '"${mount_dir}/${mount_point}"
+					local_mount=$(do_mount_share "${mount_point}" "smb://${CONN_ACCOUNT_NAME}:${key}@${CONN_ACCOUNT_NAME}.file.${CONN_SUFFIX}/${share}" "${mount_dir}/${mount_point}")
+					# do_mount_share "${mount_point}" "smb://${CONN_ACCOUNT_NAME}:${key}@${CONN_ACCOUNT_NAME}.file.${CONN_SUFFIX}/${share}" "${mount_dir}/${mount_point}"
 			        binds+=($local_mount)
-                        done
+				fi
+				done
 			;;
-		# if the account name equals the resource group without dashes, we have the default storage account at hand
+		# # if the account name equals the resource group without dashes, we have the default storage account at hand
 		"${RESOURCE_GROUP//-/}")
+			# echo '... mount' ${id##*/} 'on' ${mount_dir}'/data/'
+			get_keyvault
+			connection=$(az storage account show-connection-string --ids "${id}" | jq -r ".connectionString")
+			parse_connection_string "${connection}"
 			key=$(rawurlencode "${CONN_ACCOUNT_KEY}")
-			# mount the standard /data and /archive directories
+		# # 	# mount the standard /data and /archive directories
+			# do_mount "data" "smb://${CONN_ACCOUNT_NAME}:${key}@${CONN_ACCOUNT_NAME}.file.${CONN_SUFFIX}/data" "${mount_dir}/data"
 			local_mount=$(do_mount "data" "smb://${CONN_ACCOUNT_NAME}:${key}@${CONN_ACCOUNT_NAME}.file.${CONN_SUFFIX}/data" "${mount_dir}/data")
 			binds+=($local_mount)
-			local_mount=$(do_mount "data/archive" "smb://${CONN_ACCOUNT_NAME}:${key}@${CONN_ACCOUNT_NAME}.file.${CONN_SUFFIX}/archive" "${mount_dir}/data/archive")
+			# do_mount "archive" "smb://${CONN_ACCOUNT_NAME}:${key}@${CONN_ACCOUNT_NAME}.file.${CONN_SUFFIX}/archive" "${mount_dir}/archive"
+			local_mount=$(do_mount "archive" "smb://${CONN_ACCOUNT_NAME}:${key}@${CONN_ACCOUNT_NAME}.file.${CONN_SUFFIX}/archive" "${mount_dir}/archive")
 			binds+=($local_mount)
 			;;
+		*)
+		# echo '...' ${id##*/} 'skipped.'
 		esac
 	done
 	echo "${binds[@]}"
+	# echo 'Done with docker_mount_binds.'
 }
 
-client_name=${KEY_VAULT_NAME%-*}
-container_command="/etl/scripts/etl_${USER}.sh"
-container_command_array="[\"${container_command}\"]"
-if [ -z "${param1_value}" ]
-then
-	deployment_group="container-deployment-${USER}"   # the default name when not specifying a name
-	container_name="${container_base_name}"
-	container_group="${client_name}-${environment}-${container_name}"
-	image_name="${container_name}:${USER}"
-else
-	deployment_group="container-deployment-${USER}-${param1_value}"   # the default name when not specifying a name
-	container_name="${container_base_name}-${param1_value}"
-	container_group="${client_name}-${environment}-${container_name}"
-	image_name="${container_name}:${USER}"
-fi
-
-export CONF_KEYVAULT=${KEY_VAULT_URI}
-export AZURE_CLIENT_ID=${APP_ETL_CLIENTID}
-export AZURE_CLIENT_SECRET=${APP_ETL_PASSWORD}
-
-# run in subshell so an exit code != 0 has no consequences
-( set +e; docker rm "${container_name}"; true )
-docker build -t ${ACR_REGISTRY}/${image_name} .
-
 # we may not need it, but we are going to login anyway
+echo ''
+echo 'Step 6: Login, just to be sure that no cache has expired'
+echo '---------------------------------' 
+echo az acr login --name ${ACR_NAME} --subscription ${SUBSCRIPTION_ID}
 az acr login --name ${ACR_NAME} --subscription ${SUBSCRIPTION_ID}
 
+# build docker
+echo ''
+echo 'Step 7: Build docker container'
+echo '---------------------------------'
 if [ ${run_local} -eq 1 ]
 then
-	binds=$(docker_mount_binds "${container_name}")
-	# the env vars are set again in this local run to make copy-paste of the command complete and therefore easier
-	docker run -it --rm ${binds} --name "${container_name}" -e CONF_KEYVAULT="${KEY_VAULT_URI}" -e AZURE_TENANT_ID -e AZURE_CLIENT_ID="${APP_ETL_CLIENTID}" -e AZURE_CLIENT_SECRET="${APP_ETL_PASSWORD}" ${ACR_REGISTRY}/${image_name} "${container_command}"
+	echo docker build -t ${ACR_REGISTRY}/${image_name} .
+	# run in subshell so an exit code != 0 has no consequences
+	# ( set +e; docker rm "${container_name}"; true )
+	docker build -t ${ACR_REGISTRY}/${image_name} .
 else
+	echo docker build --platform=linux/amd64 -t ${ACR_REGISTRY}/${image_name} .
+	docker build --platform=linux/amd64 -t ${ACR_REGISTRY}/${image_name} .
+fi
+
+# run docker
+echo ''
+echo 'Step 8: Run docker container'
+echo '---------------------------------'
+if [ ${run_local} -eq 1 ]
+then
+	echo '*** running local ***'
+	# docker_mount_binds "${container_name}"
+
+	binds=$(docker_mount_binds "${container_name}")
+	# echo $binds
+	# # the env vars are set again in this local run to make copy-paste of the command complete and therefore easier
+	echo docker run -it --rm ${binds} --name "${container_name}" \
+	-e CONF_KEYVAULT="${KEY_VAULT_URI}" -e AZURE_TENANT_ID -e AZURE_CLIENT_ID="${APP_ETL_CLIENTID}" -e AZURE_CLIENT_SECRET="${APP_ETL_PASSWORD}" ${ACR_REGISTRY}/${image_name} "${container_command}"
+	docker run -it --rm ${binds} --name "${container_name}" \
+	-e CONF_KEYVAULT="${KEY_VAULT_URI}" -e AZURE_TENANT_ID -e AZURE_CLIENT_ID="${APP_ETL_CLIENTID}" -e AZURE_CLIENT_SECRET="${APP_ETL_PASSWORD}" ${ACR_REGISTRY}/${image_name} "${container_command}"
+else
+	echo '*** running on' $container_group ' ***'
+	echo docker push ${ACR_REGISTRY}/${image_name}
 	docker push ${ACR_REGISTRY}/${image_name}
 	# test existence of deployment group
+	echo `az deployment group show -g ${RESOURCE_GROUP} -n ${deployment_group}`
 	deployment_group_indicator=$(set +e; az deployment group show -g ${RESOURCE_GROUP} -n ${deployment_group} > /dev/null 2>&1; echo $?)
-	if [ "${deployment_group_indicator}" == "0" ]
-	then
+	echo '$deployment_group_indicator:' $deployment_group_indicator
+	echo [ "${deployment_group_indicator}" == "0" ]
+	if [ "${deployment_group_indicator}" == "1" ]
+	then :
 		# the deployment group already exists, just start the container
 		az container start -g ${RESOURCE_GROUP} -n ${container_group}
 	else
 		# create the deployment group with the container parameters
 		declare -a container_parameters
-#		container_parameters=( "projectName=${client_name}" \
-#			"containerProject=${container_name}" \
-#			"containerName=${container_name}" \
-#			"Containerimage=${container_name}" \
-#			"containerCommand=${container_command_array}" \
-#			"environment=${environment}" \
-#			"etlPrincipalId=${APP_ETL_CLIENTID}" \
-#			"etlPrincipalPassword=${APP_ETL_PASSWORD}" \
-#			"containerTag=${USER}" )
 		container_parameters=( "projectName=${client_name}" \
 			"containerName=${container_name}" \
-			"Containerimage=${container_name}" \
+			# "Containerimage=${container_name}" \
+			"containerProject=${container_name}" \
 			"containerCommand=${container_command_array}" \
 			"environment=${environment}" \
-			"containerRegistryUser=${APP_ETL_CLIENTID}" \
-			"containerRegistryPassword=${APP_ETL_PASSWORD}" \
+			"etlPrincipalId=${APP_ETL_CLIENTID}" \
+			"etlPrincipalPassword=${APP_ETL_PASSWORD}" \
+			"keyvaultUrl=${KEY_VAULT_URI}" \
 			"containerTag=${USER}" )
 		if [ "${param1}" != "" ]; then
 			container_parameters+=( "${param1}" )
 		fi
 		# put '-p ' for each parameter
+		# echo ${container_parameters[*]}
 		container_parameters=( "${container_parameters[@]/#/-p }" )
 		az deployment group create -g ${RESOURCE_GROUP} -n ${deployment_group} --template-file container-etl-template.json ${container_parameters[@]}
 		# we need to start it explicitly here too
@@ -209,3 +352,5 @@ else
         echo "for progress see: ${container_url}"
 	open "${container_url}"
 fi
+
+exit
